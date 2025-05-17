@@ -5,6 +5,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { v4: uuidv4 } = require("uuid");
+const WebSocket = require("ws");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -12,46 +13,71 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(bodyParser.json());
 
-const snippets = {}; // In-memory store for shareable code (use DB in prod)
+const snippets = {}; // In-memory store for snippets (replace with DB in production)
 
-app.post("/run", (req, res) => {
-  const { files, input, entryFile } = req.body;
+const server = app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
-  const folder = path.join(__dirname, `temp_${Date.now()}`);
-  fs.mkdirSync(folder);
+const wss = new WebSocket.Server({ server });
 
-  // Write each file
-  for (const [filename, content] of Object.entries(files)) {
-    fs.writeFileSync(path.join(folder, filename), content);
-  }
+wss.on("connection", (ws) => {
+  let pythonProcess = null;
+  let folder = null;
 
-  const pythonProcess = spawn("python3", [path.join(folder, entryFile)]);
+  ws.on("message", (message) => {
+    try {
+      const data = JSON.parse(message);
 
-  // Set timeout: kill process after 5 seconds
-  const timeout = setTimeout(() => {
-    pythonProcess.kill("SIGKILL");
-  }, 5000);
+      if (data.type === "start") {
+        const { files, entryFile } = data;
 
-  if (input) {
-    input.split(/\r?\n/).forEach(line => {
-      pythonProcess.stdin.write(line + "\n");
-    });
-  }
-  pythonProcess.stdin.end();
+        folder = path.join(__dirname, `temp_${Date.now()}_${Math.floor(Math.random() * 10000)}`);
+        fs.mkdirSync(folder);
 
-  let stdout = "", stderr = "";
+        for (const [filename, content] of Object.entries(files)) {
+          fs.writeFileSync(path.join(folder, filename), content);
+        }
 
-  pythonProcess.stdout.on("data", data => stdout += data.toString());
-  pythonProcess.stderr.on("data", data => stderr += data.toString());
+        // Important: '-u' for unbuffered output
+        pythonProcess = spawn("python3", ["-u", path.join(folder, entryFile)]);
 
-  pythonProcess.on("close", (code) => {
-    clearTimeout(timeout);
-    fs.rmSync(folder, { recursive: true, force: true });
-    res.send({ stdout, stderr, exitCode: code });
+        pythonProcess.stdout.on("data", (data) => {
+          ws.send(JSON.stringify({ type: "stdout", data: data.toString() }));
+        });
+
+        pythonProcess.stderr.on("data", (data) => {
+          ws.send(JSON.stringify({ type: "stderr", data: data.toString() }));
+        });
+
+        pythonProcess.on("close", (code) => {
+          if (folder) {
+            fs.rmSync(folder, { recursive: true, force: true });
+            folder = null;
+          }
+          ws.send(JSON.stringify({ type: "exit", code }));
+          pythonProcess = null;
+        });
+      } else if (data.type === "stdin") {
+        if (pythonProcess && !pythonProcess.killed) {
+          pythonProcess.stdin.write(data.data);
+        }
+      }
+    } catch (err) {
+      ws.send(JSON.stringify({ type: "stderr", data: `[Server error]: ${err.message}\n` }));
+    }
+  });
+
+  ws.on("close", () => {
+    if (pythonProcess && !pythonProcess.killed) {
+      pythonProcess.kill();
+    }
+    if (folder) {
+      fs.rmSync(folder, { recursive: true, force: true });
+      folder = null;
+    }
   });
 });
 
-// Shareable code
+// Share code snippet endpoints
 app.post("/share", (req, res) => {
   const id = uuidv4();
   snippets[id] = req.body;
@@ -63,5 +89,3 @@ app.get("/share/:id", (req, res) => {
   if (snippet) res.send(snippet);
   else res.status(404).send({ error: "Snippet not found" });
 });
-
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
